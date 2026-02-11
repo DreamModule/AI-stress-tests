@@ -1,464 +1,314 @@
-// =============================================================================
-// ECS Particle Simulation — C++20, Data-Oriented, Lock-Free
-// =============================================================================
-// Compile: g++ -std=c++20 -O3 -Wall -Wextra -march=native -o ecs ecs_particles.cpp -lpthread
-// =============================================================================
-
 #include <atomic>
-#include <array>
-#include <cassert>
-#include <chrono>
-#include <concepts>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <iostream>
+#include <memory>
 #include <new>
-#include <random>
 #include <thread>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-// =============================================================================
-// Constants
-// =============================================================================
+// Cache line size for alignment
+constexpr size_t CACHE_LINE_SIZE = 64;
 
-static constexpr std::size_t kCacheLine      = 64;
-static constexpr std::size_t kEntityCount     = 100’000;
-static constexpr std::size_t kSimIterations   = 100;
-static constexpr std::size_t kChunkSize       = 4096;
-static constexpr float       kDeltaTime       = 0.016f;   // ~60 FPS
+// Custom monotonic arena allocator (lock-free for multi-threaded allocations)
+class MonotonicArena {
+public:
+    explicit MonotonicArena(size_t size) {
+        buffer_ = static_cast<char*>(std::aligned_alloc(CACHE_LINE_SIZE, size));
+        if (!buffer_) {
+            throw std::bad_alloc{};
+        }
+        capacity_ = size;
+        offset_.store(0, std::memory_order_relaxed);
+    }
 
-static_assert(sizeof(float) == 4, “Expected IEEE-754 32-bit floats”);
+    ~MonotonicArena() {
+        std::free(buffer_);
+    }
 
-// =============================================================================
-// 1. Arena Allocator — cache-line aligned, monotonic bump allocator
-//    Zero allocations in the hot loop; all memory pre-allocated.
-// =============================================================================
+    MonotonicArena(const MonotonicArena&) = delete;
+    MonotonicArena& operator=(const MonotonicArena&) = delete;
 
+    void* allocate(size_t bytes, size_t alignment = CACHE_LINE_SIZE) {
+        size_t current = offset_.load(std::memory_order_relaxed);
+        size_t aligned_offset;
+        size_t new_offset;
+        do {
+            aligned_offset = (current + alignment - 1) & ~(alignment - 1);
+            new_offset = aligned_offset + bytes;
+            if (new_offset > capacity_) {
+                return nullptr; // Out of memory (no throw for performance)
+            }
+        } while (!offset_.compare_exchange_weak(current, new_offset,
+                                                std::memory_order_release,
+                                                std::memory_order_relaxed));
+        return buffer_ + aligned_offset;
+    }
+
+private:
+    char* buffer_ = nullptr;
+    size_t capacity_ = 0;
+    std::atomic<size_t> offset_{0};
+};
+
+// Custom allocator for std::vector using MonotonicArena
+template <typename T>
 class ArenaAllocator {
 public:
-explicit ArenaAllocator(std::size_t capacity) {
-// aligned_alloc requires size to be a multiple of alignment
-capacity_ = (capacity + kCacheLine - 1) & ~(kCacheLine - 1);
-base_     = static_cast<std::byte*>(std::aligned_alloc(kCacheLine, capacity_));
-if (!base_) {
-std::fputs(“ArenaAllocator: allocation failed\n”, stderr);
-std::abort();
-}
-offset_ = 0;
-}
+    using value_type = T;
 
-```
-~ArenaAllocator() { std::free(base_); }
+    explicit ArenaAllocator(MonotonicArena& arena) : arena_(arena) {}
 
-ArenaAllocator(const ArenaAllocator&)            = delete;
-ArenaAllocator& operator=(const ArenaAllocator&) = delete;
+    template <typename U>
+    ArenaAllocator(const ArenaAllocator<U>& other) noexcept : arena_(other.arena_) {}
 
-[[nodiscard]] void* allocate(std::size_t size,
-                             std::size_t alignment = kCacheLine) noexcept {
-    std::size_t aligned = (offset_ + alignment - 1) & ~(alignment - 1);
-    if (aligned + size > capacity_) {
-        std::fputs("ArenaAllocator: out of memory\n", stderr);
-        std::abort();
-    }
-    offset_ = aligned + size;
-    return base_ + aligned;
-}
-
-template <typename T>
-[[nodiscard]] T* alloc_array(std::size_t count) noexcept {
-    constexpr std::size_t align = (alignof(T) < kCacheLine) ? kCacheLine : alignof(T);
-    return static_cast<T*>(allocate(sizeof(T) * count, align));
-}
-
-void reset() noexcept { offset_ = 0; }
-
-[[nodiscard]] std::size_t used()     const noexcept { return offset_;   }
-[[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
-```
-
-private:
-std::byte*  base_     = nullptr;
-std::size_t capacity_ = 0;
-std::size_t offset_   = 0;
-};
-
-// =============================================================================
-// 2. Lock-Free Job System
-//    - Persistent thread pool
-//    - Atomic work-stealing via fetch_add on a shared index
-//    - No mutex, no semaphore, no lock_guard — pure atomics
-//    - Each hot atomic lives on its own cache line (no false sharing)
-// =============================================================================
-
-class JobSystem {
-public:
-using TaskFn = void (*)(std::size_t begin, std::size_t end, void* ctx);
-
-```
-explicit JobSystem(unsigned num_workers = 0) {
-    unsigned hw = std::thread::hardware_concurrency();
-    if (num_workers == 0)
-        num_workers = (hw > 1) ? (hw - 1) : 1;
-
-    shutdown_.store(false, std::memory_order_relaxed);
-    generation_.store(0, std::memory_order_relaxed);
-
-    workers_.reserve(num_workers);
-    for (unsigned i = 0; i < num_workers; ++i)
-        workers_.emplace_back([this] { worker_loop(); });
-}
-
-~JobSystem() {
-    shutdown_.store(true, std::memory_order_release);
-    // Bump generation so sleeping workers wake up and see shutdown
-    generation_.fetch_add(1, std::memory_order_release);
-    for (auto& w : workers_) w.join();
-}
-
-JobSystem(const JobSystem&)            = delete;
-JobSystem& operator=(const JobSystem&) = delete;
-
-// Parallel for: splits [0, count) into chunks and dispatches to all threads.
-// Main thread participates in work. Blocks until complete.
-void parallel_for(std::size_t count, std::size_t chunk_size,
-                  TaskFn func, void* ctx) noexcept {
-    if (count == 0) return;
-
-    const std::size_t num_chunks =
-        (count + chunk_size - 1) / chunk_size;
-
-    // Publish task parameters (non-atomic, guarded by release below)
-    task_fn_    = func;
-    task_ctx_   = ctx;
-    task_count_ = count;
-    task_chunk_ = chunk_size;
-
-    // Reset work counter
-    work_index_.store(0, std::memory_order_relaxed);
-    remaining_.store(static_cast<std::int64_t>(num_chunks),
-                     std::memory_order_relaxed);
-
-    // Release fence: all stores above become visible after this
-    generation_.fetch_add(1, std::memory_order_release);
-
-    // Main thread also steals work
-    consume_chunks();
-
-    // Spin-wait until every chunk is done
-    while (remaining_.load(std::memory_order_acquire) > 0) {
-        #if defined(__x86_64__) || defined(_M_X64)
-            __builtin_ia32_pause();
-        #else
-            std::this_thread::yield();
-        #endif
-    }
-}
-```
-
-private:
-void consume_chunks() noexcept {
-for (;;) {
-const std::size_t idx =
-work_index_.fetch_add(1, std::memory_order_relaxed);
-const std::size_t begin = idx * task_chunk_;
-if (begin >= task_count_) break;
-const std::size_t end =
-(begin + task_chunk_ < task_count_) ? begin + task_chunk_
-: task_count_;
-task_fn_(begin, end, task_ctx_);
-remaining_.fetch_sub(1, std::memory_order_release);
-}
-}
-
-```
-void worker_loop() noexcept {
-    std::uint64_t local_gen = generation_.load(std::memory_order_relaxed);
-    while (!shutdown_.load(std::memory_order_acquire)) {
-        std::uint64_t cur =
-            generation_.load(std::memory_order_acquire);
-        if (cur != local_gen) {
-            local_gen = cur;
-            consume_chunks();
-        } else {
-            #if defined(__x86_64__) || defined(_M_X64)
-                __builtin_ia32_pause();
-            #else
-                std::this_thread::yield();
-            #endif
+    T* allocate(size_t n) {
+        void* ptr = arena_.allocate(n * sizeof(T), alignof(T));
+        if (!ptr) {
+            throw std::bad_alloc{};
         }
+        return static_cast<T*>(ptr);
     }
-}
 
-// --- Each hot atomic on its own cache line to prevent false sharing ---
+    void deallocate(T*, size_t) noexcept {
+        // No-op: monotonic, no dealloc
+    }
 
-alignas(kCacheLine) std::atomic<bool>         shutdown_{false};
-alignas(kCacheLine) std::atomic<std::uint64_t> generation_{0};
-alignas(kCacheLine) std::atomic<std::size_t>   work_index_{0};
-alignas(kCacheLine) std::atomic<std::int64_t>  remaining_{0};
+    bool operator==(const ArenaAllocator&) const noexcept { return true; }
+    bool operator!=(const ArenaAllocator&) const noexcept { return false; }
 
-// Task parameters — written by dispatcher before generation release fence,
-// read by workers after generation acquire load.  No atomics needed.
-TaskFn       task_fn_    = nullptr;
-void*        task_ctx_   = nullptr;
-std::size_t  task_count_ = 0;
-std::size_t  task_chunk_ = 0;
-
-std::vector<std::thread> workers_;   // allocated once at construction
-```
-
+private:
+    MonotonicArena& arena_;
 };
 
-// =============================================================================
-// 3. ECS Core — Compile-time, zero-overhead component access
-// =============================================================================
-
-// — Concept: an SoA component must be allocatable from an arena —
+// Concept for components: must be trivially copyable for memcpy safety and performance
 template <typename T>
-concept SoAComponent = requires(T t, ArenaAllocator& a, std::size_t n) {
-{ t.allocate(a, n) } -> std::same_as<void>;
-} && std::is_default_constructible_v<T>;
+concept Component = std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>;
 
-// — Compile-time membership check —
-template <typename T, typename… Ts>
-concept ContainedIn = (std::same_as<T, Ts> || …);
+// Component storage: Dense vector for data, sparse for entity mapping (SoA, cache-friendly)
+template <Component C>
+class ComponentStorage {
+public:
+    explicit ComponentStorage(MonotonicArena& arena, size_t max_entities)
+        : dense_(ArenaAllocator<C>(arena)),
+          entity_to_dense_(max_entities, INVALID_INDEX, ArenaAllocator<size_t>(arena)),
+          dense_to_entity_(ArenaAllocator<size_t>(arena)) {
+        dense_.reserve(max_entities);
+        dense_to_entity_.reserve(max_entities);
+    }
 
-// — Compile-time type index within a pack —
-template <typename T, typename… Ts>
-struct TypeIndex;
+    size_t add(size_t entity, C&& component) {
+        if (entity_to_dense_[entity] != INVALID_INDEX) {
+            return INVALID_INDEX; // Already exists
+        }
+        size_t index = dense_.size();
+        dense_.push_back(std::move(component));
+        dense_to_entity_.push_back(entity);
+        entity_to_dense_[entity] = index;
+        return index;
+    }
 
-template <typename T, typename… Rest>
-struct TypeIndex<T, T, Rest…>
-: std::integral_constant<std::size_t, 0> {};
+    C& get(size_t entity) {
+        size_t index = entity_to_dense_[entity];
+        return dense_[index];
+    }
 
-template <typename T, typename U, typename… Rest>
-struct TypeIndex<T, U, Rest…>
-: std::integral_constant<std::size_t, 1 + TypeIndex<T, Rest…>::value> {};
+    const C& get(size_t entity) const {
+        size_t index = entity_to_dense_[entity];
+        return dense_[index];
+    }
 
-template <typename T, typename… Ts>
-inline constexpr std::size_t type_index_v = TypeIndex<T, Ts…>::value;
+    size_t size() const { return dense_.size(); }
 
-// — World: owns all component storage —
-template <SoAComponent… Cs>
+    C* data() { return dense_.data(); }
+    const C* data() const { return dense_.data(); }
+
+    size_t dense_index(size_t entity) const { return entity_to_dense_[entity]; }
+
+private:
+    static constexpr size_t INVALID_INDEX = static_cast<size_t>(-1);
+    std::vector<C, ArenaAllocator<C>> dense_;
+    std::vector<size_t, ArenaAllocator<size_t>> entity_to_dense_;
+    std::vector<size_t, ArenaAllocator<size_t>> dense_to_entity_;
+};
+
+// World: Manages entities and component storages (compile-time via tuple)
+template <Component... Cs>
 class World {
 public:
-static constexpr std::size_t component_count = sizeof…(Cs);
+    explicit World(size_t max_entities) : max_entities_(max_entities), next_entity_(0) {
+        // Pre-allocate arena: estimate size (positions + velocities + mappings)
+        size_t estimated_size = max_entities * (sizeof(Cs) + ... + 0) +
+                                max_entities * (sizeof(size_t) * 2 * sizeof...(Cs)) +
+                                CACHE_LINE_SIZE * 10; // Padding
+        arena_ = std::make_unique<MonotonicArena>(estimated_size);
+        init_storages(std::index_sequence_for<Cs...>{});
+    }
 
-```
-void init(ArenaAllocator& arena, std::size_t entity_count) noexcept {
-    count_ = entity_count;
-    std::apply([&](auto&... c) {
-        (c.allocate(arena, entity_count), ...);
-    }, storage_);
-}
+    size_t create_entity() {
+        if (next_entity_ >= max_entities_) {
+            return INVALID_ENTITY;
+        }
+        return next_entity_++;
+    }
 
-template <SoAComponent C>
-    requires ContainedIn<C, Cs...>
-[[nodiscard]] C& get() noexcept {
-    return std::get<type_index_v<C, Cs...>>(storage_);
-}
+    template <Component C>
+    void add_component(size_t entity, C&& component) {
+        get_storage<C>().add(entity, std::move(component));
+    }
 
-template <SoAComponent C>
-    requires ContainedIn<C, Cs...>
-[[nodiscard]] const C& get() const noexcept {
-    return std::get<type_index_v<C, Cs...>>(storage_);
-}
+    template <Component C>
+    C& get_component(size_t entity) {
+        return get_storage<C>().get(entity);
+    }
 
-[[nodiscard]] std::size_t size() const noexcept { return count_; }
-```
+    template <Component C>
+    const C* component_data() const {
+        return get_storage<C>().data();
+    }
+
+    template <Component C>
+    C* component_data() {
+        return get_storage<C>().data();
+    }
+
+    template <Component C>
+    size_t component_size() const {
+        return get_storage<C>().size();
+    }
 
 private:
-std::tuple<Cs…> storage_;
-std::size_t       count_ = 0;
-};
+    static constexpr size_t INVALID_ENTITY = static_cast<size_t>(-1);
+    size_t max_entities_;
+    size_t next_entity_;
+    std::unique_ptr<MonotonicArena> arena_;
+    std::tuple<ComponentStorage<Cs>...> storages_;
 
-// =============================================================================
-// 4. SoA Components — true Structure-of-Arrays for perfect vectorization
-//    Each field is a separate contiguous, cache-line-aligned array.
-// =============================================================================
-
-struct PositionSoA {
-float* x = nullptr;
-float* y = nullptr;
-float* z = nullptr;
-
-```
-void allocate(ArenaAllocator& arena, std::size_t n) noexcept {
-    x = arena.alloc_array<float>(n);
-    y = arena.alloc_array<float>(n);
-    z = arena.alloc_array<float>(n);
-}
-```
-
-};
-
-struct VelocitySoA {
-float* x = nullptr;
-float* y = nullptr;
-float* z = nullptr;
-
-```
-void allocate(ArenaAllocator& arena, std::size_t n) noexcept {
-    x = arena.alloc_array<float>(n);
-    y = arena.alloc_array<float>(n);
-    z = arena.alloc_array<float>(n);
-}
-```
-
-};
-
-// Verify concepts at compile time
-static_assert(SoAComponent<PositionSoA>);
-static_assert(SoAComponent<VelocitySoA>);
-
-// =============================================================================
-// 5. Movement System — vectorization-friendly kernel
-// =============================================================================
-
-struct MovementCtx {
-float*       px;
-float*       py;
-float*       pz;
-const float* vx;
-const float* vy;
-const float* vz;
-float        dt;
-};
-
-// Hot inner kernel: separate loops per axis for optimal auto-vectorization.
-// Each loop touches exactly 2 streams → minimal register pressure, maximum
-// throughput on wide SIMD (AVX2: 8 floats/cycle per loop).
-// **restrict** guarantees no aliasing → compiler emits vmovups/vfmadd packs.
-static void movement_kernel(std::size_t begin, std::size_t end,
-void* raw_ctx) noexcept {
-const auto* ctx = static_cast<const MovementCtx*>(raw_ctx);
-
-```
-float* __restrict__       px = ctx->px;
-float* __restrict__       py = ctx->py;
-float* __restrict__       pz = ctx->pz;
-const float* __restrict__ vx = ctx->vx;
-const float* __restrict__ vy = ctx->vy;
-const float* __restrict__ vz = ctx->vz;
-const float dt = ctx->dt;
-
-// Three independent loops — each one is a trivial reduction with no
-// cross-iteration dependency. GCC/Clang vectorize with AVX FMA packs.
-#pragma GCC ivdep
-for (std::size_t i = begin; i < end; ++i)
-    px[i] += vx[i] * dt;
-
-#pragma GCC ivdep
-for (std::size_t i = begin; i < end; ++i)
-    py[i] += vy[i] * dt;
-
-#pragma GCC ivdep
-for (std::size_t i = begin; i < end; ++i)
-    pz[i] += vz[i] * dt;
-```
-
-}
-
-// =============================================================================
-// 6. Main — setup, simulate, benchmark
-// =============================================================================
-
-int main() {
-using Clock = std::chrono::high_resolution_clock;
-
-```
-// ---- Arena: pre-allocate all simulation memory ----
-// 6 arrays × 100k floats × 4 bytes ≈ 2.4 MB; 8 MB gives headroom
-constexpr std::size_t kArenaSize = 8u * 1024u * 1024u;
-ArenaAllocator arena(kArenaSize);
-
-// ---- ECS World ----
-World<PositionSoA, VelocitySoA> world;
-world.init(arena, kEntityCount);
-
-auto& pos = world.get<PositionSoA>();
-auto& vel = world.get<VelocitySoA>();
-
-// ---- Initialize entities with deterministic random data ----
-{
-    std::mt19937 rng(42);
-    std::uniform_real_distribution<float> pos_dist(-100.0f, 100.0f);
-    std::uniform_real_distribution<float> vel_dist(-1.0f, 1.0f);
-
-    for (std::size_t i = 0; i < kEntityCount; ++i) {
-        pos.x[i] = pos_dist(rng);
-        pos.y[i] = pos_dist(rng);
-        pos.z[i] = pos_dist(rng);
-        vel.x[i] = vel_dist(rng);
-        vel.y[i] = vel_dist(rng);
-        vel.z[i] = vel_dist(rng);
+    template <size_t... Is>
+    void init_storages(std::index_sequence<Is...>) {
+        (std::get<Is>(storages_) = ComponentStorage<Cs>(*arena_, max_entities_), ...);
     }
-}
 
-// ---- Job System ----
-JobSystem jobs;
+    template <Component C>
+    ComponentStorage<C>& get_storage() {
+        return std::get<ComponentStorage<C>>(storages_);
+    }
 
-// Snapshot entity 0 before simulation
-const float x0_before = pos.x[0];
-const float y0_before = pos.y[0];
-const float z0_before = pos.z[0];
-
-// ---- Simulation loop ----
-MovementCtx ctx{
-    pos.x, pos.y, pos.z,
-    vel.x, vel.y, vel.z,
-    kDeltaTime
+    template <Component C>
+    const ComponentStorage<C>& get_storage() const {
+        return std::get<ComponentStorage<C>>(storages_);
+    }
 };
 
-const auto t_start = Clock::now();
+// Simple lock-free job system using std::thread and atomic counter
+class JobSystem {
+public:
+    explicit JobSystem(size_t num_threads) : num_threads_(num_threads), threads_(num_threads) {}
 
-for (std::size_t iter = 0; iter < kSimIterations; ++iter) {
-    jobs.parallel_for(kEntityCount, kChunkSize, movement_kernel, &ctx);
-}
+    ~JobSystem() {
+        for (auto& t : threads_) {
+            if (t.joinable()) t.join();
+        }
+    }
 
-const auto t_end = Clock::now();
+    template <typename Func>
+    void dispatch(size_t num_jobs, Func&& job_func) {
+        if (num_jobs == 0) return;
 
-// ---- Results ----
-const double total_us =
-    std::chrono::duration<double, std::micro>(t_end - t_start).count();
-const double per_iter_us = total_us / static_cast<double>(kSimIterations);
+        completed_.store(0, std::memory_order_relaxed);
+        size_t jobs_per_thread = num_jobs / num_threads_;
+        size_t remainder = num_jobs % num_threads_;
 
-std::printf("===== ECS Particle Simulation =====\n");
-std::printf("Entities       : %zu\n", kEntityCount);
-std::printf("Iterations     : %zu\n", kSimIterations);
-std::printf("Worker threads : %u (+main)\n",
-            std::thread::hardware_concurrency() > 1
-                ? std::thread::hardware_concurrency() - 1 : 1u);
-std::printf("Arena used     : %.2f KB / %.2f KB\n",
-            static_cast<double>(arena.used()) / 1024.0,
-            static_cast<double>(arena.capacity()) / 1024.0);
-std::printf("-----------------------------------\n");
-std::printf("Total time     : %.2f us (%.4f ms)\n",
-            total_us, total_us / 1000.0);
-std::printf("Per iteration  : %.2f us\n", per_iter_us);
-std::printf("Throughput     : %.2f M entities/s\n",
-            (static_cast<double>(kEntityCount) * kSimIterations)
-                / (total_us));
-std::printf("-----------------------------------\n");
-std::printf("Entity 0 pos   : (%.4f, %.4f, %.4f) -> (%.4f, %.4f, %.4f)\n",
-            static_cast<double>(x0_before),
-            static_cast<double>(y0_before),
-            static_cast<double>(z0_before),
-            static_cast<double>(pos.x[0]),
-            static_cast<double>(pos.y[0]),
-            static_cast<double>(pos.z[0]));
+        size_t start = 0;
+        for (size_t i = 0; i < num_threads_; ++i) {
+            size_t end = start + jobs_per_thread + (i < remainder ? 1 : 0);
+            threads_[i] = std::thread([this, start, end, &job_func]() {
+                for (size_t j = start; j < end; ++j) {
+                    job_func(j);
+                }
+                completed_.fetch_add(1, std::memory_order_release);
+            });
+            start = end;
+        }
 
-// ---- Validation: Δpos should equal vel * dt * iterations ----
-const float expected_x = x0_before + vel.x[0] * kDeltaTime * kSimIterations;
-const float err = pos.x[0] - expected_x;
-std::printf("Validation err : %.9f (fp accumulation)\n",
-            static_cast<double>(err));
+        // Wait lock-free
+        size_t done;
+        do {
+            done = completed_.load(std::memory_order_acquire);
+        } while (done < num_threads_);
+    }
 
-return 0;
-```
+private:
+    size_t num_threads_;
+    std::vector<std::thread> threads_;
+    std::atomic<size_t> completed_{0};
+};
 
+// Components for particle simulation
+struct Position {
+    float x, y, z;
+};
+
+struct Velocity {
+    float vx, vy, vz;
+};
+
+static_assert(Component<Position>);
+static_assert(Component<Velocity>);
+
+// Main simulation
+int main() {
+    constexpr size_t NUM_ENTITIES = 100'000;
+    constexpr size_t NUM_ITERATIONS = 100;
+    constexpr size_t NUM_THREADS = std::thread::hardware_concurrency();
+
+    World<Position, Velocity> world(NUM_ENTITIES);
+    JobSystem job_system(NUM_THREADS);
+
+    // Create entities with components (parallel creation not needed, but could be)
+    for (size_t i = 0; i < NUM_ENTITIES; ++i) {
+        size_t entity = world.create_entity();
+        world.add_component(entity, Position{0.0f, 0.0f, 0.0f});
+        world.add_component(entity, Velocity{1.0f, 1.0f, 1.0f});
+    }
+
+    // Simulation loop
+    for (size_t iter = 0; iter < NUM_ITERATIONS; ++iter) {
+        // Assume all entities have both components, size is same
+        size_t num_particles = world.component_size<Position>();
+
+        // Dispatch jobs: each job updates a chunk
+        size_t chunk_size = (num_particles + NUM_THREADS - 1) / NUM_THREADS;
+        job_system.dispatch(NUM_THREADS, [&](size_t thread_id) {
+            size_t start = thread_id * chunk_size;
+            size_t end = std::min(start + chunk_size, num_particles);
+
+            auto* positions = world.component_data<Position>();
+            auto* velocities = world.component_data<Velocity>();
+
+            // Vectorizable loops (simple arithmetic, no dependencies)
+            for (size_t i = start; i < end; ++i) {
+                positions[i].x += velocities[i].vx;
+            }
+            for (size_t i = start; i < end; ++i) {
+                positions[i].y += velocities[i].vy;
+            }
+            for (size_t i = start; i < end; ++i) {
+                positions[i].z += velocities[i].vz;
+            }
+        });
+    }
+
+    // Optional: print one for verification
+    std::cout << "Final position of entity 0: "
+              << world.get_component<Position>(0).x << ", "
+              << world.get_component<Position>(0).y << ", "
+              << world.get_component<Position>(0).z << std::endl;
+
+    return 0;
 }
